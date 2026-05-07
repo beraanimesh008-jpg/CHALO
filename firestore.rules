@@ -1,0 +1,115 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // --- Users ---
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn() && isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isValidUser(incoming()) && isOwner(userId) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'phoneNumber', 'onboardingComplete', 'driverOnboardingComplete', 'vehiclePhoto', 'aadhaarPhoto', 'accountNumber', 'ifscCode', 'isOnline', 'currentLocation', 'bikeDetails', 'totalRides', 'rating', 'role', 'updatedAt'])
+      );
+
+      function isValidUser(data) {
+        return data.uid == request.auth.uid &&
+               data.role in ['USER', 'DRIVER', 'ADMIN'];
+      }
+    }
+
+    match /test/connection {
+      allow read: if true;
+    }
+
+    // --- Rides ---
+    match /rides/{rideId} {
+      allow get: if isSignedIn() && (isOwner(existing().userId) || isOwner(existing().driverId) || existing().status == 'SEARCHING');
+      allow list: if isSignedIn() && (
+        resource.data.userId == request.auth.uid || 
+        resource.data.driverId == request.auth.uid ||
+        resource.data.status == 'SEARCHING'
+      );
+      
+      allow create: if isValidRide(incoming()) && isOwner(incoming().userId);
+      
+      allow update: if isValidRide(incoming()) && (
+        // Action: Rider accepts ride offer
+        (isOwner(existing().userId) && existing().status == 'SEARCHING' && incoming().status == 'ACCEPTED' && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['driverId', 'driverName', 'driverPhoto', 'driverRating', 'driverPhone', 'bikeDetails', 'status', 'acceptedFare', 'updatedAt'])) ||
+        
+        // Action: Driver accepts ride directly (Quick Accept)
+        (isOwner(incoming().driverId) && existing().status == 'SEARCHING' && incoming().status == 'ACCEPTED' && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['driverId', 'driverName', 'driverPhoto', 'driverRating', 'driverPhone', 'bikeDetails', 'status', 'acceptedFare', 'updatedAt'])) ||
+        
+        // Action: Status progression
+        ((isOwner(existing().userId) || isOwner(existing().driverId)) && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+
+        // Action: Driver cancels and returns to pool
+        (isOwner(existing().driverId) && existing().status in ['ACCEPTED', 'ARRIVED'] && incoming().status == 'SEARCHING' && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['driverId', 'driverName', 'driverPhoto', 'driverRating', 'driverPhone', 'bikeDetails', 'status', 'acceptedFare', 'updatedAt'])) ||
+
+        // Action: User cancels
+        (isOwner(existing().userId) && existing().status in ['SEARCHING', 'NEGOTIATING'] && incoming().status == 'CANCELLED' && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+      );
+
+      function isValidRide(data) {
+        return isValidId(data.userId) &&
+               data.status in ['SEARCHING', 'NEGOTIATING', 'ACCEPTED', 'ARRIVED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'] &&
+               data.pickup.address is string && data.pickup.address.size() <= 500 &&
+               data.pickup.lat is number && data.pickup.lng is number &&
+               data.drop.address is string && data.drop.address.size() <= 500 &&
+               data.drop.lat is number && data.drop.lng is number &&
+               data.userOfferedFare is number && data.userOfferedFare > 0 &&
+               data.userOfferedFare <= 10000;
+      }
+
+      match /offers/{driverId} {
+        allow get, list: if isSignedIn() && (isOwner(get(/databases/$(database)/documents/rides/$(rideId)).data.userId) || isOwner(driverId));
+        allow create: if isSignedIn() && isOwner(driverId) && isValidOffer(incoming());
+        allow update: if isSignedIn() && isOwner(driverId) && isValidOffer(incoming());
+        allow delete: if isSignedIn() && (isOwner(driverId) || isOwner(get(/databases/$(database)/documents/rides/$(rideId)).data.userId));
+
+        function isValidOffer(data) {
+          return data.driverId == request.auth.uid &&
+                 data.offeredFare is number && data.offeredFare > 0;
+        }
+      }
+    }
+
+    // --- Admins ---
+    match /admins/{adminId} {
+      allow read: if isSignedIn() && isOwner(adminId);
+    }
+  }
+}
